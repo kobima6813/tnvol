@@ -6,6 +6,11 @@
  * see the LICENSE file. For a commercial license see COMMERCIAL.md.
  */
 // wlc: 3D CDF9/7 wavelet + context-modelled binary range coder (tnvol invention, 2026-11-17)
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +30,6 @@
 #endif
 #ifndef NOMINMAX
 #define NOMINMAX
-#endif
-#ifndef _CRT_SECURE_NO_WARNINGS
-#define _CRT_SECURE_NO_WARNINGS
 #endif
 #include <windows.h>
 #ifdef _MSC_VER

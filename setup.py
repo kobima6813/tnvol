@@ -17,7 +17,8 @@ from setuptools.extension import Extension
 
 def _is_msvc(cc: str) -> bool:
     base = os.path.basename(cc).lower()
-    return base in ("cl", "cl.exe") or base.endswith("cl.exe")
+    # clang-cl accepts cl.exe flags; cibuildwheel often sets CC=clang-cl on Windows.
+    return base in ("cl", "cl.exe", "clang-cl", "clang-cl.exe") or base.endswith("cl.exe") or base.endswith("clang-cl")
 
 
 def _detect_cc() -> str:
@@ -70,7 +71,7 @@ def _compile_one(cc: str, src: str, dest: str, avx2: bool) -> None:
     msvc = _is_msvc(cc)
     if msvc:
         # /fp:precise matches -ffp-contract=off (no mul+add contraction).
-        flags = ["/nologo", "/O2", "/fp:precise", "/DNPAIR=16", "/LD"]
+        flags = ["/nologo", "/O2", "/fp:precise", "/D_CRT_SECURE_NO_WARNINGS", "/DNPAIR=16", "/LD"]
         if avx2:
             flags.append("/arch:AVX2")
         # Keep .obj/.exp/.lib out of the package directory.
