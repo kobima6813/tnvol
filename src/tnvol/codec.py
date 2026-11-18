@@ -10,14 +10,16 @@ compress(volume, *, psnr=None, linf=None, threads=1) -> bytes
 decompress(blob) -> (array, tau)
 info(blob) -> dict with shape, dtype, tau
 
-The native library is loaded from the built ``tnvol._libwlc`` extension, or
-from a ``libwlc.so`` sitting next to this file.
+The native library is loaded from a built ``libwlc`` shared library sitting
+next to this file (``.so`` / ``.dylib`` / ``.dll``). On x86-64 an AVX2 build
+is preferred when the CPU supports it; otherwise the portable build is used.
 """
 from __future__ import annotations
 
 import ctypes
 import glob
 import os
+import platform
 import struct
 import sys
 import tempfile
@@ -36,7 +38,70 @@ Lg = ctypes.c_long
 D = ctypes.c_double
 
 
+def _shared_exts():
+    if sys.platform == "darwin":
+        return (".dylib", ".so")
+    if sys.platform == "win32":
+        return (".dll",)
+    return (".so",)
+
+
+def _cpu_has_avx2():
+    mach = platform.machine().lower()
+    if mach not in ("x86_64", "amd64", "x64"):
+        return False
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("flags") or line.startswith("Features"):
+                    flags = " %s " % line.split(":", 1)[-1].strip()
+                    if " avx2 " in flags:
+                        return True
+    except OSError:
+        pass
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["sysctl", "-n", "hw.optional.avx2_0"],
+            stderr=subprocess.DEVNULL,
+        )
+        return out.strip() in (b"1", b"true")
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            # PF_AVX2_INSTRUCTIONS_AVAILABLE is 40 on recent Windows.
+            if ctypes.windll.kernel32.IsProcessorFeaturePresent(40):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _bind(lib):
+    lib.wlc_encode.argtypes = [P, I, I, I, D, D, D, D, I, P, Lg, P, D]
+    lib.wlc_encode.restype = Lg
+    lib.wlc_decode.argtypes = [P, Lg, P]
+    lib.wlc_shape.argtypes = [P, P]
+    lib.wlc_encode_f.argtypes = [P, I, I, I, D, D, D, D, I, P, Lg, P, D]
+    lib.wlc_encode_f.restype = Lg
+    lib.wlc_decode_f.argtypes = [P, Lg, P]
+    lib.wlc_info.argtypes = [P, P, P]
+    lib.wlc_alloc.restype = ctypes.c_void_p
+    lib.wlc_alloc.argtypes = [Lg]
+    lib.wlc_free.argtypes = [P]
+    lib.wlc_setfk.argtypes = [I]
+    lib.wlc_setfk(FK)
+    return lib
+
+
+def _is_avx2_lib(path):
+    base = os.path.basename(path).lower()
+    return "avx2" in base
+
+
 def _load_lib():
+    here = os.path.dirname(os.path.abspath(__file__))
     candidates = []
     try:
         from importlib.util import find_spec
@@ -45,36 +110,53 @@ def _load_lib():
             candidates.append(spec.origin)
     except Exception:
         pass
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(here, "libwlc.so"))
-    candidates.extend(sorted(glob.glob(os.path.join(here, "_libwlc*.so"))))
-    # Compiled in-place by setuptools (cpython tag / platform tag).
-    candidates.extend(sorted(glob.glob(os.path.join(here, "_libwlc*.abi3.so"))))
+    names = []
+    for ext in _shared_exts():
+        names.extend(["libwlc" + ext, "wlc" + ext, "libwlc_avx2" + ext, "wlc_avx2" + ext])
+    for name in names:
+        candidates.append(os.path.join(here, name))
+    for ext in _shared_exts():
+        candidates.extend(sorted(glob.glob(os.path.join(here, "_libwlc*" + ext))))
+        candidates.extend(sorted(glob.glob(os.path.join(here, "libwlc*" + ext))))
+        candidates.extend(sorted(glob.glob(os.path.join(here, "wlc*" + ext))))
+    # Keep a stable order: portable first, AVX2 after (we may upgrade).
     seen = set()
+    found = []
     for path in candidates:
         if not path or path in seen or not os.path.isfile(path):
             continue
         seen.add(path)
-        lib = ctypes.CDLL(path)
-        lib.wlc_encode.argtypes = [P, I, I, I, D, D, D, D, I, P, Lg, P, D]
-        lib.wlc_encode.restype = Lg
-        lib.wlc_decode.argtypes = [P, Lg, P]
-        lib.wlc_shape.argtypes = [P, P]
-        lib.wlc_encode_f.argtypes = [P, I, I, I, D, D, D, D, I, P, Lg, P, D]
-        lib.wlc_encode_f.restype = Lg
-        lib.wlc_decode_f.argtypes = [P, Lg, P]
-        lib.wlc_info.argtypes = [P, P, P]
-        lib.wlc_alloc.restype = ctypes.c_void_p
-        lib.wlc_alloc.argtypes = [Lg]
-        lib.wlc_free.argtypes = [P]
-        lib.wlc_setfk.argtypes = [I]
-        lib.wlc_setfk(FK)
-        return lib
-    raise ImportError(
-        "tnvol native library not found. Install the package with pip "
-        "(a C compiler and AVX2-capable x86-64 Linux are required) "
-        "or build libwlc.so next to codec.py."
-    )
+        found.append(path)
+    if not found:
+        raise ImportError(
+            "tnvol native library not found. Install the package with pip "
+            "(a C compiler is required) or build libwlc next to codec.py."
+        )
+    portable = [p for p in found if not _is_avx2_lib(p)]
+    avx2_libs = [p for p in found if _is_avx2_lib(p)]
+    # Always load a portable library first when one exists: it is safe on every
+    # CPU and can report AVX2 support via wlc_cpu_avx2.
+    first = (portable or avx2_libs)[0]
+    if not portable and avx2_libs and not _cpu_has_avx2():
+        raise ImportError(
+            "tnvol found an AVX2-only native library but this CPU does not "
+            "support AVX2. Build or install the portable libwlc."
+        )
+    lib = _bind(ctypes.CDLL(first))
+    want_avx2 = False
+    if avx2_libs:
+        if hasattr(lib, "wlc_cpu_avx2"):
+            try:
+                want_avx2 = bool(lib.wlc_cpu_avx2())
+            except Exception:
+                want_avx2 = _cpu_has_avx2()
+        else:
+            want_avx2 = _cpu_has_avx2()
+    if want_avx2 and avx2_libs:
+        avx_path = avx2_libs[0]
+        if os.path.abspath(avx_path) != os.path.abspath(first):
+            lib = _bind(ctypes.CDLL(avx_path))
+    return lib
 
 
 lib = _load_lib()
@@ -257,6 +339,8 @@ def _par(jobs, fn):
             fd, path = tempfile.mkstemp(prefix="wlcmt")
             os.close(fd)
             files.append(path)
+            if not hasattr(os, "fork"):
+                raise RuntimeError("threads>1 is only supported on POSIX (uses fork())")
             pid = os.fork()
             if pid == 0:
                 try:

@@ -13,8 +13,37 @@
 #include <math.h>
 #include <time.h>
 #include <stddef.h>
+#if defined(__AVX2__)
 #include <immintrin.h>
+#define WLC_AVX2 1
+#else
+#define WLC_AVX2 0
+#endif
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#include <windows.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+#else
 #include <sys/mman.h>
+#endif
+#ifdef _MSC_VER
+#define restrict __restrict
+#endif
+#ifdef _WIN32
+#define WLC_API __declspec(dllexport)
+#else
+#define WLC_API
+#endif
 #ifndef POPW
 #define POPW 0
 #endif
@@ -22,14 +51,73 @@
 #define HUGEP 0
 #endif
 /* no MADV_HUGEPAGE by default: with THP defrag=madvise a fragmented host does synchronous compaction in the page fault (one gate point burned 467 s of sys CPU) */
-static void* balloc(size_t b){ size_t A=1<<21; size_t r=(b+A-1)/A*A; void* p=aligned_alloc(A,r); if(p && HUGEP) madvise(p,r,MADV_HUGEPAGE); if(p && POPW && r>=(1u<<22)) madvise(p,r,23 /* MADV_POPULATE_WRITE: one call instead of a fault per page */); return p; }
-void* wlc_alloc(long b){ return balloc((size_t)b); } void wlc_free(void* p){ free(p); }
+static void* balloc(size_t b){
+  if(!b) b=1;
+#ifdef _WIN32
+  return malloc(b);
+#else
+  size_t A=1<<21; size_t r=(b+A-1)/A*A; void* p=NULL;
+  if(posix_memalign(&p,A,r)) return NULL;
+#ifdef MADV_HUGEPAGE
+  if(p && HUGEP) madvise(p,r,MADV_HUGEPAGE);
+#endif
+#if defined(MADV_POPULATE_WRITE)
+  if(p && POPW && r>=(1u<<22)) madvise(p,r,MADV_POPULATE_WRITE);
+#else
+  if(p && POPW && r>=(1u<<22)) madvise(p,r,23 /* MADV_POPULATE_WRITE */);
+#endif
+  return p;
+#endif
+}
+WLC_API void* wlc_alloc(long b){ return balloc((size_t)b); }
+WLC_API void wlc_free(void* p){ free(p); }
+#ifdef _WIN32
+static double now(void){
+  static LARGE_INTEGER f; static int init=0; LARGE_INTEGER c;
+  if(!init){ QueryPerformanceFrequency(&f); init=1; }
+  QueryPerformanceCounter(&c); return (double)c.QuadPart/(double)f.QuadPart;
+}
+double TM[8];
+static double cpun(void){
+  FILETIME cr,ex,ke,us; ULARGE_INTEGER k,u;
+  if(!GetProcessTimes(GetCurrentProcess(),&cr,&ex,&ke,&us)) return 0;
+  k.LowPart=ke.dwLowDateTime; k.HighPart=ke.dwHighDateTime;
+  u.LowPart=us.dwLowDateTime; u.HighPart=us.dwHighDateTime;
+  return (k.QuadPart+u.QuadPart)*1e-7;
+}
+#else
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+1e-9*t.tv_nsec; }
 double TM[8];
 static double cpun(void){ struct timespec t; clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&t); return t.tv_sec+1e-9*t.tv_nsec; }
-double PF[16]; static double ZR=0; double wlc_zr(void){ return ZR; } static double RHO=0; static float MAXE=0;
+#endif
+static inline float hsum8s(const float t[8]){ return ((t[0]+t[1])+(t[2]+t[3]))+((t[4]+t[5])+(t[6]+t[7])); }
+WLC_API int wlc_build_avx2(void){ return WLC_AVX2; }
+WLC_API int wlc_cpu_avx2(void){
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#ifdef _MSC_VER
+  int info[4]; __cpuid(info, 1);
+  if((info[2] & (1<<27))==0 || (info[2] & (1<<28))==0) return 0;
+  unsigned long long xcr = _xgetbv(0);
+  if((xcr & 6ull)!=6ull) return 0;
+  __cpuidex(info, 7, 0);
+  return (info[1] & (1<<5))!=0;
+#else
+  unsigned int eax,ebx,ecx,edx;
+  __asm__ __volatile__("cpuid":"=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx):"a"(1),"c"(0));
+  if((ecx&(1u<<27))==0 || (ecx&(1u<<28))==0) return 0;
+  unsigned int xeax,xedx; unsigned int xcr_leaf=0;
+  __asm__ __volatile__(".byte 0x0f,0x01,0xd0":"=a"(xeax),"=d"(xedx):"c"(xcr_leaf));
+  if((xeax&6u)!=6u) return 0;
+  __asm__ __volatile__("cpuid":"=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx):"a"(7),"c"(0));
+  return (ebx&(1u<<5))!=0;
+#endif
+#else
+  return 0;
+#endif
+}
+double PF[16]; static double ZR=0; WLC_API double wlc_zr(void){ return ZR; } static double RHO=0; static float MAXE=0;
 #define MK(k) {double t2_=cpun(); PF[k]+=t2_-pt_; pt_=t2_;}
-void wlc_prof(double* o){ memcpy(o,PF,sizeof(PF)); memset(PF,0,sizeof(PF)); }
+WLC_API void wlc_prof(double* o){ memcpy(o,PF,sizeof(PF)); memset(PF,0,sizeof(PF)); }
 
 /* ---------------- range coder (LZMA-style, 12-bit probs from 2-rate mix) ---------------- */
 typedef struct { uint64_t low; uint32_t range; uint8_t cache; uint64_t csize; uint8_t* out; long pos, cap; } Enc;
@@ -531,10 +619,17 @@ static void fit_filter_raw(const float* b,const uint16_t* v,const float* vf,floa
     long r0=(st2-cnt%st2)%st2; for(long x=2+r0;x<nx-2 && ns<cap;x+=st2) sa[ns++]=act(b,(long)z*sz+(long)y*nx+x,sz,nx); cnt+=w_; }
   qsort(sa,ns,sizeof(float),cmpf); for(int k=0;k<K-1;k++) h->fth[k]=sa[(long)(ns*(k+1))/K]; free(sa);
   double* A=(double*)calloc((size_t)K*NFT*NFT,sizeof(double)); double* bb=(double*)calloc((size_t)K*NFT,sizeof(double)); double* e0=(double*)calloc(K,sizeof(double)); float f[NFT];
-#if FITV
+#if FITV && WLC_AVX2
   /* AVX2 accumulation: float*float products are exact in double, and every element keeps its sample order -> bit-identical to the scalar loop */
-  { enum { NP=(NFT+3)&~3 }; double* A2=(double*)aligned_alloc(32,sizeof(double)*K*NFT*NP+32); double* b2=(double*)aligned_alloc(32,sizeof(double)*K*NP+32);
-    memset(A2,0,sizeof(double)*K*NFT*NP); memset(b2,0,sizeof(double)*K*NP); double fd[NP] __attribute__((aligned(32)));
+  { enum { NP=(NFT+3)&~3 };
+#ifdef _MSC_VER
+    double* A2=(double*)_aligned_malloc(sizeof(double)*K*NFT*NP+32,32); double* b2=(double*)_aligned_malloc(sizeof(double)*K*NP+32,32);
+    __declspec(align(32)) double fd[NP];
+#else
+    double* A2=(double*)aligned_alloc(32,sizeof(double)*K*NFT*NP+32); double* b2=(double*)aligned_alloc(32,sizeof(double)*K*NP+32);
+    double fd[NP] __attribute__((aligned(32)));
+#endif
+    memset(A2,0,sizeof(double)*K*NFT*NP); memset(b2,0,sizeof(double)*K*NP);
     for(int z=2;z<nz-2;z++) for(int y=2;y<ny-2;y+=stp) for(int x=2+(y/stp+z)%stp;x<nx-2;x+=stp){ long i=(long)z*sz+(long)y*nx+x;
       int k=fcls(act(b,i,sz,nx),h->fth,K); feats(b,i,po,f); double t= vf? (double)vf[i]-c0 : (double)v[i]-c0;
       for(int a=0;a<NP;a++) fd[a]= a<NFT? (double)f[a] : 0.0;
@@ -544,7 +639,13 @@ static void fit_filter_raw(const float* b,const uint16_t* v,const float* vf,floa
         for(int c=a&~3;c<NP;c+=4) _mm256_store_pd(row+c,_mm256_add_pd(_mm256_load_pd(row+c),_mm256_mul_pd(FA,_mm256_load_pd(fd+c)))); }
       e0[k]+=(t-f[0])*(t-f[0]); }
     for(int k=0;k<K;k++){ for(int a=0;a<NFT;a++){ bb[k*NFT+a]=b2[k*NP+a]; for(int c2=a;c2<NFT;c2++) A[(size_t)k*NFT*NFT+a*NFT+c2]=A2[(size_t)k*NFT*NP+a*NP+c2]; } }
-    free(A2); free(b2); }
+#ifdef _MSC_VER
+    _aligned_free(A2); _aligned_free(b2);
+#else
+    free(A2); free(b2);
+#endif
+  }
+
 #else
   for(int z=2;z<nz-2;z++) for(int y=2;y<ny-2;y+=stp) for(int x=2+(y/stp+z)%stp;x<nx-2;x+=stp){ long i=(long)z*sz+(long)y*nx+x;
     int k=fcls(act(b,i,sz,nx),h->fth,K); feats(b,i,po,f); double t= vf? (double)vf[i]-c0 : (double)v[i]-c0; double* Ak=A+(size_t)k*NFT*NFT;
@@ -561,15 +662,19 @@ static void fit_filter_raw(const float* b,const uint16_t* v,const float* vf,floa
 }
 static void fit_filter(const float* b,const uint16_t* v,const float* vf,float c0,int nz,int ny,int nx,Hdr* h,int K){ double t_=cpun(); fit_filter_raw(b,v,vf,c0,nz,ny,nx,h,K); PF[2]+=cpun()-t_;  }
 static void apply_filter(const float* b,float* o,int nz,int ny,int nx,const Hdr* h);
+#if WLC_AVX2
 #ifndef NOFMA
 #define FMAV(a,b,c) _mm256_fmadd_ps(a,b,c)
 #else
 #define FMAV(a,b,c) _mm256_add_ps(c,_mm256_mul_ps(a,b))
 #endif
+#endif
 static void apply_filter_raw(const float* b,float* o,int nz,int ny,int nx,const Hdr* h){
   long sz=(long)ny*nx; long n=(long)nz*sz; long po[28]; for(int k=0;k<NPAIR;k++) po[k]=PO[k][0]*sz+PO[k][1]*(long)nx+PO[k][2];
-  memcpy(o,b,sizeof(float)*n); int K=h->nfc; int32_t* cl=(int32_t*)malloc(sizeof(int32_t)*(nx+8)); float* acc=(float*)malloc(sizeof(float)*(nx+8));
+  memcpy(o,b,sizeof(float)*n); int K=h->nfc; int32_t* cl=(int32_t*)malloc(sizeof(int32_t)*(nx+8));
   float wt[NFT][8]; for(int a=0;a<NFT;a++) for(int k=0;k<8;k++) wt[a][k]= k<K? h->fw[k][a] : 0;
+#if WLC_AVX2
+  float* acc=(float*)malloc(sizeof(float)*(nx+8));
   __m256 W[NFT]; for(int a=0;a<NFT;a++) W[a]=_mm256_loadu_ps(wt[a]);
   for(int z=2;z<nz-2;z++) for(int y=2;y<ny-2;y++){ long i0=(long)z*sz+(long)y*nx; const float* p=b+i0;
     { int x=2; __m256 AB=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), TWO=_mm256_set1_ps(2.f);
@@ -588,7 +693,39 @@ static void apply_filter_raw(const float* b,float* o,int nz,int ny,int nx,const 
       _mm256_storeu_ps(o+i0+x,s); }
     for(;x<nx-2;x++){ int k=cl[x]; float s=wt[0][k]*p[x]+wt[NPAIR+1][k]; for(int a=0;a<NPAIR;a++){ long oo=po[a]; s+=wt[a+1][k]*(p[x+oo]+p[x-oo]); } o[i0+x]=s; }
   }
-  free(cl); free(acc); }
+  free(cl); free(acc);
+#else
+  for(int z=2;z<nz-2;z++) for(int y=2;y<ny-2;y++){ long i0=(long)z*sz+(long)y*nx; const float* p=b+i0;
+    int x=2;
+    for(;x+8<=nx-2;x+=8){
+      for(int k=0;k<8;k++){
+        float c2=2*p[x+k];
+        float a1=fabsf((c2-p[x+k-1])-p[x+k+1]);
+        float a2=fabsf((c2-p[x+k-nx])-p[x+k+nx]);
+        float a3=fabsf((c2-p[x+k-sz])-p[x+k+sz]);
+        float ac=(a1+a2)+a3; int cls=0; for(int t=0;t<K-1;t++) cls+=(ac>=h->fth[t]); cl[x+k]=cls;
+      }
+    }
+    for(;x<nx-2;x++){ float c2=2*p[x]; float ac=fabsf(c2-p[x-1]-p[x+1])+fabsf(c2-p[x-nx]-p[x+nx])+fabsf(c2-p[x-sz]-p[x+sz]); int k=0; for(int t=0;t<K-1;t++) k+=(ac>=h->fth[t]); cl[x]=k; }
+    x=2;
+    for(;x+8<=nx-2;x+=8){
+      for(int k=0;k<8;k++){
+        int cls=cl[x+k]; float s=wt[0][cls]*p[x+k]+wt[NPAIR+1][cls];
+        for(int a=0;a<NPAIR;a++){ long oo=po[a]; float f=p[x+k+oo]+p[x+k-oo];
+#ifndef NOFMA
+          s=fmaf(wt[a+1][cls],f,s);
+#else
+          s+=wt[a+1][cls]*f;
+#endif
+        }
+        o[i0+x+k]=s;
+      }
+    }
+    for(;x<nx-2;x++){ int k=cl[x]; float s=wt[0][k]*p[x]+wt[NPAIR+1][k]; for(int a=0;a<NPAIR;a++){ long oo=po[a]; s+=wt[a+1][k]*(p[x+oo]+p[x-oo]); } o[i0+x]=s; }
+  }
+  free(cl);
+#endif
+}
 static void recon2(const int32_t* q,float* buf,int32_t* r,int nz,int ny,int nx,const int* Ls,int* bx,int nb,const float* w,float d,const float* off,int vmin,int vmax,Hdr* h,const uint16_t* fitv,const float* fitf,int K,float c);
 static void recon(const int32_t* q,float* buf,int32_t* r,int nz,int ny,int nx,const int* Ls,int* bx,int nb,const float* w,float d,const float* off,int vmin,int vmax,Hdr* h,const uint16_t* fitv,int K){ recon2(q,buf,r,nz,ny,nx,Ls,bx,nb,w,d,off,vmin,vmax,h,fitv,NULL,K,0.5f*(vmin+vmax)); }
 static float* RSCR=NULL; /* caller-provided scratch (n floats) for the filter output; avoids a fresh n-float allocation (page faults = sys CPU) */
@@ -596,21 +733,29 @@ static void recon2(const int32_t* q,float* buf,int32_t* r,int nz,int ny,int nx,c
   long sz=(long)ny*nx; int L=Lmax3(Ls[0],Ls[1],Ls[2]);
   for(int k=0;k<nb;k++){ int* B=bx+9*k; float o=off[clsof(B[6],B[7],L)]; float s=d/w[k];
     for(int z=B[0];z<B[1];z++) for(int y=B[2];y<B[3];y++){ long i0=(long)z*sz+(long)y*nx;
-      int x=B[4]; { const __m256i Z8=_mm256_setzero_si256(); const __m256 O8=_mm256_set1_ps(o), S8=_mm256_set1_ps(s), ONE8=_mm256_set1_ps(1.0f);
+      int x=B[4];
+#if WLC_AVX2
+      { const __m256i Z8=_mm256_setzero_si256(); const __m256 O8=_mm256_set1_ps(o), S8=_mm256_set1_ps(s), ONE8=_mm256_set1_ps(1.0f);
         for(;x+8<=B[5];x+=8){ __m256i v8=_mm256_loadu_si256((const __m256i*)(q+i0+x)); __m256 sg=_mm256_sub_ps(_mm256_and_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v8,Z8)),ONE8),_mm256_and_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(Z8,v8)),ONE8));
           _mm256_storeu_ps(buf+i0+x,_mm256_mul_ps(_mm256_add_ps(_mm256_cvtepi32_ps(v8),_mm256_mul_ps(sg,O8)),S8)); } } /* r10: AVX dequant, same float ops */
+#endif
       for(;x<B[5];x++){ int v=q[i0+x]; float sg=(float)((v>0)-(v<0)); buf[i0+x]=((float)v+sg*o)*s; } } }
   dwt3(buf,nz,ny,nx,Ls[0],Ls[1],Ls[2],1);
   long n=(long)nz*sz;
   if(fitv||fitf){ if(K>1) fit_filter(buf,fitv,fitf,c,nz,ny,nx,h,K); else h->nfc=0; }
   if(h->nfc>0){ float* o= RSCR? RSCR : (float*)balloc(sizeof(float)*n); apply_filter(buf,o,nz,ny,nx,h); memcpy(buf,o,sizeof(float)*n); if(!RSCR) free(o); }
-  if(r){ long i=0; __m256 C=_mm256_set1_ps(c); __m256i LO=_mm256_set1_epi32(vmin), HI=_mm256_set1_epi32(vmax);
+  if(r){ long i=0;
+#if WLC_AVX2
+    __m256 C=_mm256_set1_ps(c); __m256i LO=_mm256_set1_epi32(vmin), HI=_mm256_set1_epi32(vmax);
     for(;i+8<=n;i+=8){ __m256i t=_mm256_cvtps_epi32(_mm256_add_ps(_mm256_loadu_ps(buf+i),C)); t=_mm256_max_epi32(t,LO); t=_mm256_min_epi32(t,HI); _mm256_storeu_si256((__m256i*)(r+i),t); }
+#endif
     for(;i<n;i++){ long t=lrintf(buf[i]+c); if(t<vmin)t=vmin; if(t>vmax)t=vmax; r[i]=(int32_t)t; } }
 }
 static void apply_filter(const float* b,float* o,int nz,int ny,int nx,const Hdr* h){ double t_=cpun(); apply_filter_raw(b,o,nz,ny,nx,h); PF[3]+=cpun()-t_;  }
 /* ---- rate control helpers: predicted MSE of the deadzone quantizer with per-class centroids on a coefficient sample ---- */
-static inline float hsum8(__m256 v){ float t[8]; _mm256_storeu_ps(t,v); return ((t[0]+t[1])+(t[2]+t[3]))+((t[4]+t[5])+(t[6]+t[7])); }
+#if WLC_AVX2
+static inline float hsum8(__m256 v){ float t[8]; _mm256_storeu_ps(t,v); return hsum8s(t); }
+#endif
 /* samples are kept sorted by class (csort) so every class is a contiguous run: no gathers, AVX loops */
 static void csort(uint8_t* sc,float* sv,long ns){ long cnt[17]={0}; for(long j=0;j<ns;j++) cnt[sc[j]+1]++; for(int c=0;c<16;c++) cnt[c+1]+=cnt[c];
   float* t=(float*)malloc(sizeof(float)*ns); long p[16]; for(int c=0;c<16;c++) p[c]=cnt[c]; for(long j=0;j<ns;j++) t[p[sc[j]]++]=sv[j];
@@ -618,16 +763,27 @@ static void csort(uint8_t* sc,float* sv,long ns){ long cnt[17]={0}; for(long j=0
 static void csegs(const uint8_t* sc,long ns,long* sg){ for(int c=0;c<=16;c++){ long lo=0,hi=ns; while(lo<hi){ long m=(lo+hi)/2; if(sc[m]<c) lo=m+1; else hi=m; } sg[c]=lo; } }
 static double rc_pred(const uint8_t* sc,const float* sv,long ns,double dd,double rnd,double addc,float* off){
   long sg[17]; csegs(sc,ns,sg); float id_=(float)(1.0/dd), fd_=(float)dd; double tot=0;
+#if WLC_AVX2
   __m256 ID=_mm256_set1_ps(id_), RN=_mm256_set1_ps((float)rnd), Z=_mm256_setzero_ps(), ONE=_mm256_set1_ps(1.f), FD=_mm256_set1_ps(fd_);
+#endif
   for(int c=0;c<16;c++){ long a=sg[c], b=sg[c+1]; if(b<=a){ off[c]=(float)(0.5-rnd); continue; }
     double sm=0, ct=0; long j=a;
+#if WLC_AVX2
     while(j+8<=b){ __m256 S=Z, C=Z; long e=j+2048<b? j+2048 : b; for(;j+8<=e;j+=8){ __m256 aa=_mm256_mul_ps(_mm256_loadu_ps(sv+j),ID); __m256 qq=_mm256_floor_ps(_mm256_add_ps(aa,RN)); __m256 nz=_mm256_cmp_ps(qq,Z,_CMP_GT_OQ);
         S=_mm256_add_ps(S,_mm256_and_ps(nz,_mm256_sub_ps(aa,qq))); C=_mm256_add_ps(C,_mm256_and_ps(nz,ONE)); } sm+=hsum8(S); ct+=hsum8(C); }
+#else
+    while(j+8<=b){ float S[8]={0}, C[8]={0}; long e=j+2048<b? j+2048 : b; for(;j+8<=e;j+=8){ for(int k=0;k<8;k++){ float aa=sv[j+k]*id_; float qq=floorf(aa+(float)rnd); if(qq>0){ S[k]+=aa-qq; C[k]+=1.f; } } } sm+=hsum8s(S); ct+=hsum8s(C); }
+#endif
     for(;j<b;j++){ float aa=sv[j]*id_; float qq=floorf(aa+(float)rnd); if(qq>0){ sm+=aa-qq; ct+=1; } }
     double o= ct>0? sm/ct : 0.5-rnd; if(o<-0.5)o=-0.5; if(o>0.5)o=0.5; off[c]=(float)o;
-    __m256 OF=_mm256_set1_ps(off[c]); j=a;
+    j=a;
+#if WLC_AVX2
+    { __m256 OF=_mm256_set1_ps(off[c]);
     while(j+8<=b){ __m256 S=Z; long e=j+2048<b? j+2048 : b; for(;j+8<=e;j+=8){ __m256 x=_mm256_loadu_ps(sv+j); __m256 qq=_mm256_floor_ps(_mm256_add_ps(_mm256_mul_ps(x,ID),RN)); __m256 nz=_mm256_cmp_ps(qq,Z,_CMP_GT_OQ);
-        __m256 rr=_mm256_and_ps(nz,_mm256_mul_ps(_mm256_add_ps(qq,OF),FD)); __m256 d=_mm256_sub_ps(x,rr); S=_mm256_add_ps(S,_mm256_mul_ps(d,d)); } tot+=hsum8(S); }
+        __m256 rr=_mm256_and_ps(nz,_mm256_mul_ps(_mm256_add_ps(qq,OF),FD)); __m256 d=_mm256_sub_ps(x,rr); S=_mm256_add_ps(S,_mm256_mul_ps(d,d)); } tot+=hsum8(S); } }
+#else
+    while(j+8<=b){ float S[8]={0}; long e=j+2048<b? j+2048 : b; for(;j+8<=e;j+=8){ for(int k=0;k<8;k++){ float x=sv[j+k]; float qq=floorf(x*id_+(float)rnd); float rr= qq>0? (qq+off[c])*fd_:0; float d=x-rr; S[k]+=d*d; } } tot+=hsum8s(S); }
+#endif
     for(;j<b;j++){ float aa=sv[j]; float qq=floorf(aa*id_+(float)rnd); float rr= qq>0? (qq+off[c])*fd_:0; tot+=(double)(aa-rr)*(aa-rr); } }
   return tot/ns+addc; }
 static double rc_solve(const uint8_t* sc,const float* sv,long ns,double rnd,double addc,double tm,double lo,double hi,float* off){
@@ -651,13 +807,22 @@ static double lag1corr_f(const float* v,int nz,int ny,int nx){ long sz=(long)ny*
   return best; }
 static void levels_for(const int* sh,int* Ls,int maxl){ for(int a=0;a<3;a++){ int ml= a==0? (maxl/10) : (maxl%10); if(maxl<10) ml=maxl; if(maxl>=100) ml= a==0? 0 : maxl%10; /* 1xy: no z transform; 2pxy: z packet with p levels (PKZ) */ int L=0; double n=sh[a]; while(L<ml && n/4.0>=2.0){ n=ceil(n/2); L++; } Ls[a]=L; } }
 int FK=6;
-void wlc_setfk(int k){ FK=k; }
-static void fminmax(const float* v,long n,float* mn,float* mx){ __m256 a=_mm256_set1_ps(v[0]), b=a; long i=0;
+WLC_API void wlc_setfk(int k){ FK=k; }
+static void fminmax(const float* v,long n,float* mn,float* mx){
+  long i=0; float lo,hi;
+#if WLC_AVX2
+  __m256 a=_mm256_set1_ps(v[0]), b=a;
   for(;i+8<=n;i+=8){ __m256 x=_mm256_loadu_ps(v+i); a=_mm256_min_ps(a,x); b=_mm256_max_ps(b,x); }
-  float ta[8],tb[8]; _mm256_storeu_ps(ta,a); _mm256_storeu_ps(tb,b); float lo=ta[0],hi=tb[0]; for(int k=1;k<8;k++){ if(ta[k]<lo)lo=ta[k]; if(tb[k]>hi)hi=tb[k]; }
+  float ta[8],tb[8]; _mm256_storeu_ps(ta,a); _mm256_storeu_ps(tb,b); lo=ta[0]; hi=tb[0]; for(int k=1;k<8;k++){ if(ta[k]<lo)lo=ta[k]; if(tb[k]>hi)hi=tb[k]; }
+#else
+  float a[8], b[8]; for(int k=0;k<8;k++) a[k]=b[k]=v[0];
+  for(;i+8<=n;i+=8){ for(int k=0;k<8;k++){ float x=v[i+k]; a[k]= (a[k]<x)? a[k]:x; b[k]= (b[k]>x)? b[k]:x; } }
+  lo=a[0]; hi=b[0]; for(int k=1;k<8;k++){ if(a[k]<lo)lo=a[k]; if(b[k]>hi)hi=b[k]; }
+#endif
   for(;i<n;i++){ if(v[i]<lo)lo=v[i]; if(v[i]>hi)hi=v[i]; } *mn=lo; *mx=hi; }
 /* quantise a row: cn<-cn*id (scaled), q=sign*floor(|cn|+rnd); returns sum of (|cn|-|q|) over nonzero q and their count */
 static inline void qrow(float* restrict cn,int32_t* restrict q,int w,float id,float rnd,double* sm,long* ct){ float s=0; int c=0; int x=0;
+#if WLC_AVX2
   __m256 ID=_mm256_set1_ps(id), RN=_mm256_set1_ps(rnd), AB=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), SG=_mm256_castsi256_ps(_mm256_set1_epi32(0x80000000)), Z=_mm256_setzero_ps(), ONE=_mm256_set1_ps(1.f);
   __m256 S=Z, CC=Z;
   for(;x+8<=w;x+=8){ __m256 a=_mm256_mul_ps(_mm256_loadu_ps(cn+x),ID); _mm256_storeu_ps(cn+x,a); __m256 aa=_mm256_and_ps(a,AB);
@@ -665,21 +830,39 @@ static inline void qrow(float* restrict cn,int32_t* restrict q,int w,float id,fl
     S=_mm256_add_ps(S,_mm256_and_ps(nz,_mm256_sub_ps(aa,qq))); CC=_mm256_add_ps(CC,_mm256_and_ps(nz,ONE));
     __m256 sq=_mm256_or_ps(qq,_mm256_and_ps(a,SG)); _mm256_storeu_si256((__m256i*)(q+x),_mm256_cvttps_epi32(sq)); }
   s=hsum8(S); c=(int)hsum8(CC);
+#else
+  float S[8]={0}, CC[8]={0};
+  for(;x+8<=w;x+=8){ for(int k=0;k<8;k++){ float a=cn[x+k]*id; cn[x+k]=a; float aa=fabsf(a); float qq=floorf(aa+rnd); if(qq>0){ S[k]+=aa-qq; CC[k]+=1.f; } q[x+k]=(int32_t)(a<0?-qq:qq); } }
+  s=hsum8s(S); c=(int)hsum8s(CC);
+#endif
   for(;x<w;x++){ float a=cn[x]*id; cn[x]=a; float aa=fabsf(a); float qq=floorf(aa+rnd); float nzm=(qq>0)?1.f:0.f; s+=nzm*(aa-qq); c+=(int)nzm; q[x]=(int32_t)(a<0?-qq:qq); }
   *sm+=s; *ct+=c; }
 static inline void orow(const float* restrict cn,const int32_t* restrict q,int w,double* sm,long* ct){ float s=0; int c=0; int x=0;
+#if WLC_AVX2
   __m256 AB=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)), Z=_mm256_setzero_ps(), ONE=_mm256_set1_ps(1.f), S=Z, CC=Z;
   for(;x+8<=w;x+=8){ __m256 aq=_mm256_cvtepi32_ps(_mm256_abs_epi32(_mm256_loadu_si256((const __m256i*)(q+x)))); __m256 nz=_mm256_cmp_ps(aq,Z,_CMP_GT_OQ);
     S=_mm256_add_ps(S,_mm256_and_ps(nz,_mm256_sub_ps(_mm256_and_ps(_mm256_loadu_ps(cn+x),AB),aq))); CC=_mm256_add_ps(CC,_mm256_and_ps(nz,ONE)); }
   s=hsum8(S); c=(int)hsum8(CC);
+#else
+  float S[8]={0}, CC[8]={0};
+  for(;x+8<=w;x+=8){ for(int k=0;k<8;k++){ int qq=q[x+k]; int aq=qq<0?-qq:qq; if(aq){ S[k]+=fabsf(cn[x+k])-(float)aq; CC[k]+=1.f; } } }
+  s=hsum8s(S); c=(int)hsum8s(CC);
+#endif
   for(;x<w;x++){ int qq=q[x]; int aq=qq<0?-qq:qq; float nzm= aq? 1.f:0.f; s+=nzm*(fabsf(cn[x])-(float)aq); c+=aq?1:0; } *sm+=s; *ct+=c; }
 /* clamp recon to [mn,mx], return sum sq err (double) and max |err| (float) */
 static void finrow(const float* restrict v,float* restrict b,long n,float c0,float mn,float mx,double* ss,float* me){
-  __m256 C=_mm256_set1_ps(c0), MN=_mm256_set1_ps(mn), MX=_mm256_set1_ps(mx), M=_mm256_setzero_ps(), AB=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff)); double tot=0; long i=0;
+  double tot=0; long i=0; float m=0;
+#if WLC_AVX2
+  __m256 C=_mm256_set1_ps(c0), MN=_mm256_set1_ps(mn), MX=_mm256_set1_ps(mx), M=_mm256_setzero_ps(), AB=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
   while(i+8<=n){ __m256 S=_mm256_setzero_ps(); long e=i+512<n? i+512: n; for(;i+8<=e;i+=8){ __m256 xr=_mm256_add_ps(_mm256_loadu_ps(b+i),C); xr=_mm256_min_ps(_mm256_max_ps(xr,MN),MX); _mm256_storeu_ps(b+i,xr);
       __m256 d=_mm256_sub_ps(_mm256_loadu_ps(v+i),xr); S=_mm256_add_ps(S,_mm256_mul_ps(d,d)); M=_mm256_max_ps(M,_mm256_and_ps(d,AB)); }
     float t[8]; _mm256_storeu_ps(t,S); for(int k=0;k<8;k++) tot+=t[k]; }
-  float t[8]; _mm256_storeu_ps(t,M); float m=0; for(int k=0;k<8;k++) if(t[k]>m)m=t[k];
+  { float t[8]; _mm256_storeu_ps(t,M); for(int k=0;k<8;k++) if(t[k]>m)m=t[k]; }
+#else
+  float M[8]={0};
+  while(i+8<=n){ float S[8]={0}; long e=i+512<n? i+512: n; for(;i+8<=e;i+=8){ for(int k=0;k<8;k++){ float xr=b[i+k]+c0; if(xr<mn)xr=mn; if(xr>mx)xr=mx; b[i+k]=xr; float d=v[i+k]-xr; S[k]+=d*d; float ad=fabsf(d); if(ad>M[k]) M[k]=ad; } } for(int k=0;k<8;k++) tot+=S[k]; }
+  for(int k=0;k<8;k++) if(M[k]>m)m=M[k];
+#endif
   for(;i<n;i++){ float xr=b[i]+c0; if(xr<mn)xr=mn; if(xr>mx)xr=mx; b[i]=xr; float d=v[i]-xr; tot+=(double)d*d; if(fabsf(d)>m)m=fabsf(d); }
   *ss=tot; *me=m; }
 /* ---- R8 optional high-effort mode (encoder only; decoder and bitstream format unchanged): post-filter-aware requantisation.
@@ -763,11 +946,18 @@ static double zest_bits(const void* v,int isf,int nz,int ny,int nx,int maxl,doub
   int qb[64];
   for(int k=0;k<nb;k++){ int* B=bx+9*k; int c=clsof(B[6],B[7],L); float s_=(float)(w[k]/d);
     for(int z0=B[0];z0<B[1];z0+=4) for(int y0=B[2];y0<B[3];y0+=4) for(int x0=B[4];x0<B[5];x0+=4){ if(ZEHALF && (((z0-B[0])>>2)+((y0-B[2])>>2)+((x0-B[4])>>2))&1) continue; /* checkerboard half of the cells */ int any=0; memset(qb,0,sizeof(qb));
-      if(x0+4<=B[5]){ const __m128 S_=_mm_set1_ps(s_), RN_=_mm_set1_ps((float)rnd), AB4=_mm_castsi128_ps(_mm_set1_epi32(0x7fffffff)); __m128i AN=_mm_setzero_si128(), ONE4=_mm_set1_epi32(1);
+      if(x0+4<=B[5]){
+#if WLC_AVX2
+        const __m128 S_=_mm_set1_ps(s_), RN_=_mm_set1_ps((float)rnd), AB4=_mm_castsi128_ps(_mm_set1_epi32(0x7fffffff)); __m128i AN=_mm_setzero_si128(), ONE4=_mm_set1_epi32(1);
         for(int z=z0;z<z0+4 && z<B[1];z++) for(int y=y0;y<y0+4 && y<B[3];y++){ const float* r=cn+(long)z*sz+(long)y*nx+x0;
           __m128i q4=_mm_cvttps_epi32(_mm_floor_ps(_mm_add_ps(_mm_mul_ps(_mm_and_ps(_mm_loadu_ps(r),AB4),S_),RN_))); AN=_mm_or_si128(AN,q4);
           _mm_storeu_si128((__m128i*)(qb+((z-z0)*4+(y-y0))*4),_mm_add_epi32(q4,ONE4)); }
-        AN=_mm_or_si128(AN,_mm_srli_si128(AN,8)); AN=_mm_or_si128(AN,_mm_srli_si128(AN,4)); any=_mm_cvtsi128_si32(AN); }
+        AN=_mm_or_si128(AN,_mm_srli_si128(AN,8)); AN=_mm_or_si128(AN,_mm_srli_si128(AN,4)); any=_mm_cvtsi128_si32(AN);
+#else
+        for(int z=z0;z<z0+4 && z<B[1];z++) for(int y=y0;y<y0+4 && y<B[3];y++){ const float* r=cn+(long)z*sz+(long)y*nx; for(int x=x0;x<x0+4 && x<B[5];x++){
+          int q=(int)floorf(fabsf(r[x])*s_+(float)rnd); qb[((z-z0)*4+(y-y0))*4+(x-x0)]= q+1; any|=q; } }
+#endif
+      }
       else for(int z=z0;z<z0+4 && z<B[1];z++) for(int y=y0;y<y0+4 && y<B[3];y++){ const float* r=cn+(long)z*sz+(long)y*nx; for(int x=x0;x<x0+4 && x<B[5];x++){
         int q=(int)floorf(fabsf(r[x])*s_+(float)rnd); qb[((z-z0)*4+(y-y0))*4+(x-x0)]= q+1; any|=q; } }
       hc[c][any!=0]++; if(!any) continue;
@@ -782,8 +972,8 @@ static double zest_bits(const void* v,int isf,int nz,int ny,int nx,int maxl,doub
   PKZ=pk0; return bits; }
 
 
-long wlc_encode(const uint16_t* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam);
-long wlc_encode_f(const float* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam);
+WLC_API long wlc_encode(const uint16_t* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam);
+WLC_API long wlc_encode_f(const float* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam);
 static int ZTSKIP_=ZTSKIP;
 #ifndef ZSHARE
 #define ZSHARE 1
@@ -879,7 +1069,7 @@ static int ztrial(const void* v,int isf,int nz,int ny,int nx,double psnr,double 
     long eab_=EABORT; EABORT=0; long L= isf? wlc_encode_f((const float*)c,nz,cy,cx,pc,linf,kt,rnd,cand[k],o,cap,NULL,lam) : wlc_encode((const uint16_t*)c,nz,cy,cx,pc,linf,kt,rnd,cand[k],o,cap,NULL,lam); EABORT=eab_;
     if(k==0) best=L; else if(L < best*(1-ZTM)){ best=L; bm=cand[k]; } }
   ZTON=1; FDIR=fd; free(o); free(c); if(getenv("WLC_ZTDBG")) fprintf(stderr,"ZT %dx%dx%d p%.1f l%g -> maxl %d\n",nz,ny,nx,psnr,linf,bm); return bm; }
-long wlc_encode(const uint16_t* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam){
+WLC_API long wlc_encode(const uint16_t* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam){
   double pt_=cpun(); long n=(long)nz*ny*nx, sz=(long)ny*nx; int sh[3]={nz,ny,nx}; int Ls[3]; levels_for(sh,Ls,maxl); int L=Lmax3(Ls[0],Ls[1],Ls[2]);
   int vmin=65535,vmax=0; { uint16_t a_=65535,b_=0; for(long i=0;i<n;i++){ uint16_t t_=v[i]; a_= t_<a_? t_:a_; b_= t_>b_? t_:b_; } vmin=a_; vmax=b_; }
   double R=vmax-vmin; if(R<1)R=1; int autok= (psnr<=0 && kt<=0);
@@ -928,8 +1118,8 @@ long wlc_encode(const uint16_t* v,int nz,int ny,int nx,double psnr,double linf,d
   if(stats){ stats[0]=mse; stats[1]=tau; stats[2]=nout; stats[3]=h.l1; stats[4]=h.l2; stats[5]=d; stats[6]=RHO; stats[7]=kt; }
   free(cn); free(q); return p;
 }
-int wlc_shape(const uint8_t* in,int* sh){ Hdr h; memcpy(&h,in,sizeof(h)); sh[0]=h.nz; sh[1]=h.ny; sh[2]=h.nx; sh[3]=h.tau; return 0; }
-int wlc_decode(const uint8_t* in,long len,uint16_t* outv){
+WLC_API int wlc_shape(const uint8_t* in,int* sh){ Hdr h; memcpy(&h,in,sizeof(h)); sh[0]=h.nz; sh[1]=h.ny; sh[2]=h.nx; sh[3]=h.tau; return 0; }
+WLC_API int wlc_decode(const uint8_t* in,long len,uint16_t* outv){
   Hdr h; memcpy(&h,in,sizeof(h)); int nz=h.nz,ny=h.ny,nx=h.nx; long n=(long)nz*ny*nx; int Ls[3]={h.Lz,h.Ly,h.Lx}; PKZ=h.pad;
   int32_t* q=(int32_t*)balloc(sizeof(int32_t)*n); float* buf=(float*)balloc(sizeof(float)*n);
   long p=sizeof(Hdr); GZW= h.pad2? h.pad2 : 2; dec_coefs(in+p,h.l1,nz,ny,nx,Ls[0],Ls[1],Ls[2],q); p+=h.l1;
@@ -937,10 +1127,13 @@ int wlc_decode(const uint8_t* in,long len,uint16_t* outv){
   RSCR=(float*)q; recon(q,buf,NULL,nz,ny,nx,Ls,bx,nb,w,h.d,h.off,h.vmin,h.vmax,&h,NULL,0); RSCR=NULL;
   memset(q,0,sizeof(int32_t)*n); if(h.l2>0){ Dec d; d_init(&d,in+p,h.l2); uint8_t* ec=(uint8_t*)balloc(n); make_ec(buf,nz,ny,nx,h.tau,ec); out_code(q,ec,nz,ny,nx,NULL,&d); free(ec); } int st=2*h.tau+1;
   /* fused: r = clamp(rint(buf+c)) (same rounding as recon's r path), then + q*(2tau+1), clamp, store uint16 - no n-int32 r array */
-  float c=0.5f*(h.vmin+h.vmax); long i=0; __m256 C=_mm256_set1_ps(c); __m256i LO=_mm256_set1_epi32(h.vmin), HI=_mm256_set1_epi32(h.vmax), ST=_mm256_set1_epi32(st);
+  float c=0.5f*(h.vmin+h.vmax); long i=0;
+#if WLC_AVX2
+  { __m256 C=_mm256_set1_ps(c); __m256i LO=_mm256_set1_epi32(h.vmin), HI=_mm256_set1_epi32(h.vmax), ST=_mm256_set1_epi32(st);
   for(;i+8<=n;i+=8){ __m256i t=_mm256_cvtps_epi32(_mm256_add_ps(_mm256_loadu_ps(buf+i),C)); t=_mm256_min_epi32(_mm256_max_epi32(t,LO),HI);
     t=_mm256_add_epi32(t,_mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*)(q+i)),ST)); t=_mm256_min_epi32(_mm256_max_epi32(t,LO),HI);
-    __m128i lo=_mm256_castsi256_si128(t), hi=_mm256_extracti128_si256(t,1); _mm_storeu_si128((__m128i*)(outv+i),_mm_packus_epi32(lo,hi)); }
+    __m128i lo=_mm256_castsi256_si128(t), hi=_mm256_extracti128_si256(t,1); _mm_storeu_si128((__m128i*)(outv+i),_mm_packus_epi32(lo,hi)); } }
+#endif
   for(;i<n;i++){ long r=lrintf(buf[i]+c); if(r<h.vmin)r=h.vmin; if(r>h.vmax)r=h.vmax; long t=r+(long)q[i]*st; if(t<h.vmin)t=h.vmin; if(t>h.vmax)t=h.vmax; outv[i]=(uint16_t)t; }
   free(q); free(buf); return 0;
 }
@@ -948,7 +1141,7 @@ int wlc_decode(const uint8_t* in,long len,uint16_t* outv){
 /* ---------------- float32 path: same pipeline, quantized L-inf correction k*2tau ---------------- */
 static inline float ffin(float xr,int k,float st){ return xr+(float)k*st; }
 static float fstep(float tau,float mn,float mx){ float am=fabsf(mn)>fabsf(mx)?fabsf(mn):fabsf(mx); float u=am*(1.0f/8388608.0f); float st=2*tau*(1.0f-1.0f/1024)-6*u; if(st<tau*0.25f) st=tau*0.25f; return st; }
-float* DBGO=NULL; void wlc_dbg(float* p){ DBGO=p; }
+float* DBGO=NULL; WLC_API void wlc_dbg(float* p){ DBGO=p; }
 #ifndef DMED
 #define DMED 1
 #endif
@@ -1011,10 +1204,15 @@ static long wlc_encode_f_core(const float* v,int nz,int ny,int nx,double psnr,do
   float tau; if(linf>0) tau=nextafterf((float)linf,0.0f); else if(kt>0) tau=(float)(kt*sqrt(mse>0?mse:1e-30)); else { tau=nextafterf(nextafterf(MAXE,INFINITY),INFINITY); /* float |err| max, 2 ulp safety */ } if(!(tau>0)) tau=(float)(R*1e-7); float st=fstep(tau,vmn,vmx); long nout=0;
   int32_t* kk=q; /* reuse */
   float tfast=tau*(1.0f-1.0f/65536);
+#if WLC_AVX2
   const __m256 TF_=_mm256_set1_ps(tfast), AB_=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
-  for(long i=0;i<n;i++){ if(!DBGO && (i&7)==0 && i+8<=n){ /* 8 voxels all within tfast -> k=0 (identical test, vectorised) */
+#endif
+  for(long i=0;i<n;i++){
+#if WLC_AVX2
+    if(!DBGO && (i&7)==0 && i+8<=n){ /* 8 voxels all within tfast -> k=0 (identical test, vectorised) */
       __m256 d_=_mm256_and_ps(_mm256_sub_ps(_mm256_loadu_ps(v+i),_mm256_loadu_ps(buf+i)),AB_);
       if(_mm256_movemask_ps(_mm256_cmp_ps(d_,TF_,_CMP_LE_OQ))==0xff){ _mm256_storeu_si256((__m256i*)(kk+i),_mm256_setzero_si256()); i+=7; continue; } }
+#endif
     float xr=buf[i]; if(!DBGO && (fabsf(v[i]-xr)<=tfast || (MKM && MKM[i]))){ kk[i]=0; continue; } /* r9: floor voxels are restored exactly from the mask */ double e=(double)v[i]-(double)xr; int k=0;
     if(fabs(e)>tau){ k=(int)lrint(e/st); if(k==0) k=e>0?1:-1;
       for(int g=0;g<8 && fabs((double)v[i]-(double)ffin(xr,k,st))>tau;g++){ int k2= k+(((double)v[i]>(double)ffin(xr,k,st))?1:-1); if(k2==0) break; k=k2; }
@@ -1028,7 +1226,7 @@ static long wlc_encode_f_core(const float* v,int nz,int ny,int nx,double psnr,do
   if(stats){ stats[0]=mse; stats[1]=tau; stats[2]=nout; stats[3]=h.l1; stats[4]=h.l2; stats[5]=d; stats[6]=RHO; stats[7]=kt; }
   free(cn); free(q); return p;
 }
-int wlc_info(const uint8_t* in,int* sh,float* tf){ uint32_t mg_; memcpy(&mg_,in,4); if(mg_==0x434c5733){ int32_t t[8]; memcpy(t,in,32); sh[0]=t[1]; sh[1]=t[2]; sh[2]=t[3]; sh[3]=0; sh[4]=1; memcpy(tf,in+24,4); return 0; }
+WLC_API int wlc_info(const uint8_t* in,int* sh,float* tf){ uint32_t mg_; memcpy(&mg_,in,4); if(mg_==0x434c5733){ int32_t t[8]; memcpy(t,in,32); sh[0]=t[1]; sh[1]=t[2]; sh[2]=t[3]; sh[3]=0; sh[4]=1; memcpy(tf,in+24,4); return 0; }
   Hdr h; memcpy(&h,in,sizeof(h)); sh[0]=h.nz; sh[1]=h.ny; sh[2]=h.nx; sh[3]=h.tau; sh[4]=h.isf; tf[0]=h.ftau; return 0; }
 static int wlc_decode_f_core(const uint8_t* in,long len,float* outv){
   Hdr h; memcpy(&h,in,sizeof(h)); int nz=h.nz,ny=h.ny,nx=h.nx; long n=(long)nz*ny*nx; int Ls[3]={h.Lz,h.Ly,h.Lx}; PKZ=h.pad;
@@ -1037,13 +1235,19 @@ static int wlc_decode_f_core(const uint8_t* in,long len,float* outv){
   int bx[256*9]; int nb=boxes(nz,ny,nx,Ls[0],Ls[1],Ls[2],bx); float w[256]; box_w(bx,nb,Ls,w);
   RSCR=(float*)q; recon2(q,buf,NULL,nz,ny,nx,Ls,bx,nb,w,h.d,h.off,0,0,&h,NULL,NULL,0,h.fc0); RSCR=NULL;
   { /* r10: AVX clamp; without a correction layer it writes the output directly (identical values) */
-    float* dst= h.l2>0? buf : outv; const __m256 C8=_mm256_set1_ps(h.fc0), MN8=_mm256_set1_ps(h.fmn), MX8=_mm256_set1_ps(h.fmx); long i=0;
-    for(;i+8<=n;i+=8) _mm256_storeu_ps(dst+i,_mm256_min_ps(_mm256_max_ps(_mm256_add_ps(_mm256_loadu_ps(buf+i),C8),MN8),MX8));
+    float* dst= h.l2>0? buf : outv; long i=0;
+#if WLC_AVX2
+    { const __m256 C8=_mm256_set1_ps(h.fc0), MN8=_mm256_set1_ps(h.fmn), MX8=_mm256_set1_ps(h.fmx);
+    for(;i+8<=n;i+=8) _mm256_storeu_ps(dst+i,_mm256_min_ps(_mm256_max_ps(_mm256_add_ps(_mm256_loadu_ps(buf+i),C8),MN8),MX8)); }
+#endif
     for(;i<n;i++){ float xr=buf[i]+h.fc0; if(xr<h.fmn)xr=h.fmn; if(xr>h.fmx)xr=h.fmx; dst[i]=xr; } }
   if(h.l2>0){ memset(q,0,sizeof(int32_t)*n); Dec d; d_init(&d,in+p,h.l2); uint8_t* ec=(uint8_t*)balloc(n); make_ec(buf,nz,ny,nx,h.ftau,ec); out_code(q,ec,nz,ny,nx,NULL,&d); free(ec);
-    float st=fstep(h.ftau,h.fmn,h.fmx); const __m256 ST8=_mm256_set1_ps(st); const __m256i Z8=_mm256_setzero_si256(); long i=0;
+    float st=fstep(h.ftau,h.fmn,h.fmx); long i=0;
+#if WLC_AVX2
+    { const __m256 ST8=_mm256_set1_ps(st); const __m256i Z8=_mm256_setzero_si256();
     for(;i+8<=n;i+=8){ __m256i k8=_mm256_loadu_si256((const __m256i*)(q+i)); __m256 xr=_mm256_loadu_ps(buf+i); __m256 y=_mm256_add_ps(xr,_mm256_mul_ps(_mm256_cvtepi32_ps(k8),ST8));
-      _mm256_storeu_ps(outv+i,_mm256_blendv_ps(y,xr,_mm256_castsi256_ps(_mm256_cmpeq_epi32(k8,Z8)))); }
+      _mm256_storeu_ps(outv+i,_mm256_blendv_ps(y,xr,_mm256_castsi256_ps(_mm256_cmpeq_epi32(k8,Z8)))); } }
+#endif
     for(;i<n;i++) outv[i]= q[i]? ffin(buf[i],q[i],st) : buf[i]; }
   free(q); free(buf); return 0;
 }
@@ -1128,13 +1332,13 @@ static int wlc_decode_f_mk(const uint8_t* in,long len,float* outv){ Hdr h; memcp
   long n=(long)h.nz*h.ny*h.nx; uint8_t* m=(uint8_t*)calloc(n,1); Dec d; d_init(&d,in+Li,ml); mask_code(m,h.nz,h.ny,h.nx,NULL,&d);
   for(long i=0;i<n;i++) if(m[i]) outv[i]=fl; free(m); return 0; }
 
-int wlc_zpick(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int skip){ int sh[3]={nz,ny,nx}, Ls[3]; levels_for(sh,Ls,maxl);
+WLC_API int wlc_zpick(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int skip){ int sh[3]={nz,ny,nx}, Ls[3]; levels_for(sh,Ls,maxl);
   double R; if(isf){ float a,b; fminmax((const float*)v,(long)nz*ny*nx,&a,&b); R=(double)b-a; if(R<=0)R=1e-30; } else { int a=65535,b=0; long n=(long)nz*ny*nx; for(long i=0;i<n;i++){ int t=((const uint16_t*)v)[i]; a=t<a?t:a; b=t>b?t:b; } R=b-a; if(R<1)R=1; }
   int s0=ZTSKIP_; ZTSKIP_=skip; int m=ztrial(v,isf,nz,ny,nx,psnr,linf,(psnr>0?0.0:-1.0),0.38,maxl,0.08,Ls,R); ZTSKIP_=s0; free(ZCACHE); ZCACHE=NULL; return m; }
 
-int wlc_zpick2(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int share){ int s0=ZSHARE_; ZSHARE_=share; int m=wlc_zpick(v,isf,nz,ny,nx,psnr,linf,maxl,0); ZSHARE_=s0; return m; }
+WLC_API int wlc_zpick2(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int share){ int s0=ZSHARE_; ZSHARE_=share; int m=wlc_zpick(v,isf,nz,ny,nx,psnr,linf,maxl,0); ZSHARE_=s0; return m; }
 
-int wlc_zpick3(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int dec){ ZLASTMG=-1; ZLASTD=-1; int s0=ZDEC_; ZDEC_=dec; int m=wlc_zpick(v,isf,nz,ny,nx,psnr,linf,maxl,0); ZDEC_=s0; return m; }
+WLC_API int wlc_zpick3(const void* v,int isf,int nz,int ny,int nx,double psnr,double linf,int maxl,int dec){ ZLASTMG=-1; ZLASTD=-1; int s0=ZDEC_; ZDEC_=dec; int m=wlc_zpick(v,isf,nz,ny,nx,psnr,linf,maxl,0); ZDEC_=s0; return m; }
 
 /* ---------------- r10: PALETTE / PREDICTIVE mode for low-cardinality volumes (engineering; prior art: palette coding
    (PNG, HEVC-SCC palette mode), near-lossless predictive coding with context-modelled residuals (JPEG-LS/LOCO-I, CALIC,
@@ -1278,7 +1482,7 @@ static int pal_decode(const uint8_t* in,long len,float* outv){ PHdr h; memcpy(&h
   Dec d; d_init(&d,in+p,len-p); pal_code(I,h.nz,h.ny,h.nx,h.K,h.pm,h.pad,NULL,&d); for(long i=0;i<n;i++) outv[i]=rep[I[i]]; free(I); return 0; }
 /* r10 wrapper: palette candidate first (only if the 1M-voxel sample has <= PLK distinct values), then the wavelet/mask encoder
    with an exact early abort once its coefficient stream alone exceeds the palette stream. Keeps the smaller stream. */
-long wlc_encode_f(const float* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam){
+WLC_API long wlc_encode_f(const float* v,int nz,int ny,int nx,double psnr,double linf,double kt,double rnd,int maxl,uint8_t* out,long cap,double* stats,double lam){
   const char* ev=getenv("WLC_PAL"); if(MKBUSY || !(ev? atoi(ev) : PLON)) return wlc_encode_f_mk(v,nz,ny,nx,psnr,linf,kt,rnd,maxl,out,cap,stats,lam);
   long n=(long)nz*ny*nx; long c2= n*2+65536*4+(1<<16); uint8_t* o2=(uint8_t*)malloc(c2); long L2=-1, L, eab=EABORT;
   /* order only affects speed (each side aborts exactly once it is larger than the finished other side): low PSNR targets,
@@ -1289,4 +1493,4 @@ long wlc_encode_f(const float* v,int nz,int ny,int nx,double psnr,double linf,do
     L=wlc_encode_f_mk(v,nz,ny,nx,psnr,linf,kt,rnd,maxl,out,cap,stats,lam); EABORT=eab; }
   if(PLDBG>0) fprintf(stderr,"PL wavelet %ld palette %ld order %s -> %s\n",L,L2,wfirst?"W":"P",(L2>0&&L2<L)?"palette":"wavelet");
   if(L2>0 && L2<L && L2<=cap){ memcpy(out,o2,L2); if(stats) memset(stats,0,8*sizeof(double)); L=L2; } free(o2); return L; }
-int wlc_decode_f(const uint8_t* in,long len,float* outv){ uint32_t m; memcpy(&m,in,4); if(m==MAGIC3) return pal_decode(in,len,outv); return wlc_decode_f_mk(in,len,outv); }
+WLC_API int wlc_decode_f(const uint8_t* in,long len,float* outv){ uint32_t m; memcpy(&m,in,4); if(m==MAGIC3) return pal_decode(in,len,outv); return wlc_decode_f_mk(in,len,outv); }

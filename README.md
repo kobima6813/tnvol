@@ -22,9 +22,9 @@ random access, and a prediction mode specialised for sparse cloud fields.
 
 ## Requirements
 
-- Linux on x86-64 with AVX2
-- A C compiler (`gcc` or `clang`) for a source install
 - Python 3.9+ and NumPy
+- Linux, macOS, or Windows, on x86-64 or ARM (Apple Silicon, aarch64)
+- A C compiler (`gcc`, `clang`, or MSVC) for a source install
 
 ## Install
 
@@ -32,9 +32,16 @@ random access, and a prediction mode specialised for sparse cloud fields.
 pip install .
 ```
 
-This compiles the native codec. The build uses `-DNPAIR=16 -mavx2 -mfma
--ffp-contract=off`, which is the configuration that matches the numbers below.
-Do not change those flags if you want to reproduce the benches.
+This compiles the native codec. The build uses `-DNPAIR=16 -ffp-contract=off`
+(MSVC: `/DNPAIR=16 /fp:precise`), which is the configuration that matches the
+numbers below. On x86-64 it also builds an AVX2 library (`-mavx2 -mfma`, or
+`/arch:AVX2`) and loads it at runtime when the CPU supports AVX2. The portable
+and AVX2 builds produce bit-identical streams. Do not change `NPAIR` or the
+floating-point flags if you want to reproduce the benches.
+
+Binary wheels for Linux (x86_64 and aarch64), macOS (x86_64 and arm64), and
+Windows (amd64) are built in CI. A public PyPI upload, if any, will be
+announced separately.
 
 Nothing in this tree is published automatically. A public repository, if any,
 will be announced separately.
@@ -75,8 +82,9 @@ In `--linf` / `linf=` mode the encoder guarantees the bound you asked for. In
 correction layer uses that value); the reconstructed volume stays within it.
 
 Optional `--threads N` (or `threads=N`) splits the volume into independent
-z-slabs. That path is Linux-only and changes the stream layout (`WLCM`
-container). The default single-thread stream is the one used in the benches.
+z-slabs. That path uses `fork()` and is POSIX-only; it also changes the stream
+layout (`WLCM` container). The default single-thread stream is the one used in
+the benches.
 
 ## Benchmarks
 
@@ -175,11 +183,14 @@ A compact record of the numbers we measured is in `benches/RESULTS.md`.
 
 ## Limitations
 
-- Supported platform today: Linux x86-64 with AVX2. There is no scalar fallback.
+- Platforms: Linux, macOS, and Windows, on x86-64 and ARM (Apple Silicon,
+  aarch64). On x86-64 an AVX2 library is used when the CPU supports it;
+  otherwise a portable scalar path is used. Both produce bit-identical
+  streams. The published r10 numbers were measured with the AVX2 build.
 - Inputs must be finite: NaN and Inf are not supported.
 - Only 3-D C-order `float32` and `uint16` are accepted.
-- Multi-slab `--threads` uses `fork()` and is not a bit-identical substitute
-  for the single-thread stream used in the benches.
+- Multi-slab `--threads` uses `fork()` (POSIX only) and is not a bit-identical
+  substitute for the single-thread stream used in the benches.
 
 ## License
 
