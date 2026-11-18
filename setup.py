@@ -102,7 +102,11 @@ def _compile_one(cc: str, src: str, dest: str, avx2: bool) -> None:
             subprocess.check_call(cmd)
             shutil.copy2(out, dest)
         return
-    flags = ["-O3", "-ffp-contract=off", "-DNPAIR=16", "-fPIC"]
+    flags = ["-O3", "-ffp-contract=off", "-DNPAIR=16"]
+    # -fPIC is required for shared objects on Unix; clang-for-Windows (MSVC
+    # target) rejects it.
+    if sys.platform != "win32":
+        flags.append("-fPIC")
     # clang on Windows (and elsewhere) also understands the precise fp model.
     if "clang" in os.path.basename(cc).lower():
         flags.append("-ffp-model=precise")
