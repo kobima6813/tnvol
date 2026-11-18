@@ -21,15 +21,33 @@ def _is_msvc(cc: str) -> bool:
     return base in ("cl", "cl.exe", "clang-cl", "clang-cl.exe") or base.endswith("cl.exe") or base.endswith("clang-cl")
 
 
+def _gnu_clang_on_windows() -> str | None:
+    """Prefer clang.exe over clang-cl so -ffp-contract=off is honored."""
+    for cand in ("clang", "clang.exe"):
+        path = shutil.which(cand)
+        if path:
+            return path
+    return None
+
+
 def _detect_cc() -> str:
     env = os.environ.get("CC")
-    if env:
-        return env
     if sys.platform == "win32":
+        # cibuildwheel sets CC=clang-cl, which ignores GCC-style flags and
+        # produced r10-incompatible and AVX2-disagreeing streams in CI.
+        base = os.path.basename(env or "").lower()
+        if not env or base in ("clang-cl", "clang-cl.exe"):
+            clang = _gnu_clang_on_windows()
+            if clang:
+                return clang
+        if env:
+            return env
         for cand in ("cl", "clang-cl", "gcc", "clang", "cc"):
             if shutil.which(cand):
                 return cand
         return "cl"
+    if env:
+        return env
     for cand in ("cc", "gcc", "clang"):
         if shutil.which(cand):
             return cand
@@ -85,6 +103,9 @@ def _compile_one(cc: str, src: str, dest: str, avx2: bool) -> None:
             shutil.copy2(out, dest)
         return
     flags = ["-O3", "-ffp-contract=off", "-DNPAIR=16", "-fPIC"]
+    # clang on Windows (and elsewhere) also understands the precise fp model.
+    if "clang" in os.path.basename(cc).lower():
+        flags.append("-ffp-model=precise")
     if avx2:
         flags.extend(["-mavx2", "-mfma"])
     if sys.platform == "darwin":
