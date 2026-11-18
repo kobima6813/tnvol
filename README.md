@@ -185,8 +185,11 @@ A compact record of the numbers we measured is in `benches/RESULTS.md`.
 
 - Platforms: Linux, macOS, and Windows, on x86-64 and ARM (Apple Silicon,
   aarch64). On x86-64 an AVX2 library is used when the CPU supports it;
-  otherwise a portable scalar path is used. Both produce bit-identical
-  streams. The published r10 numbers were measured with the AVX2 build.
+  otherwise a portable scalar path is used. On Linux and macOS those two
+  builds produce bit-identical streams, matching the published r10 codec.
+  The published r10 numbers were measured with the AVX2 build. On Windows
+  the same source is used and the error bound is honoured, but streams may
+  differ from the gcc r10 reference because of the system C library.
 - Inputs must be finite: NaN and Inf are not supported.
 - Only 3-D C-order `float32` and `uint16` are accepted.
 - Multi-slab `--threads` uses `fork()` (POSIX only) and is not a bit-identical
