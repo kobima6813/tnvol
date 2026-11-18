@@ -1,0 +1,12 @@
+include LICENSE
+include COMMERCIAL.md
+include README.md
+include Makefile
+include pyproject.toml
+include setup.py
+graft src
+graft tests
+graft benches
+global-exclude *.pyc
+global-exclude *.so
+global-exclude __pycache__
